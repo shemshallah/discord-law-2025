@@ -1,0 +1,496 @@
+
+#!/usr/bin/env python3
+"""
+CHIMERA STATE VALIDATION + QUANTUM RESERVOIR COMPUTING
+========================================================
+Two experiments in one 15-minute window
+"""
+
+import numpy as np
+from qiskit import QuantumCircuit, transpile
+from azure.quantum import Workspace
+from azure.quantum.qiskit import AzureQuantumProvider
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import warnings
+from scipy.stats import entropy
+import csv
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+CONNECTION_STRING = "SubscriptionId=xxx;ResourceGroupName=xxx;WorkspaceName=xxx;ApiKey=xxx;QuantumEndpoint=https://westus.quantum.azure.com/;"
+
+
+MAX_RUNTIME = 15 * 60  # 15 minutes
+MAX_WORKERS = 8
+SHOTS = 1000
+
+print("="*80)
+print("   CHIMERA VALIDATION + QUANTUM RESERVOIR COMPUTING")
+print("="*80)
+print("\nPART 1: Chimera State Deep Validation (30 measurements)")
+print("PART 2: Quantum Reservoir Computing (30 measurements)")
+print(f"\nConfiguration:")
+print(f"  • Runtime limit: {MAX_RUNTIME//60} minutes")
+print(f"  • Parallel workers: {MAX_WORKERS}")
+print(f"  • Target measurements: 60")
+print(f"  • Shots per measurement: {SHOTS}")
+print("="*80 + "\n")
+
+# ============================================================================
+# BACKEND CONNECTION - VERBATIM FROM WORKING CODE
+# ============================================================================
+workspace = Workspace.from_connection_string(CONNECTION_STRING)
+provider = AzureQuantumProvider(workspace)
+backend = None
+
+for b in provider.backends():
+    if 'rigetti' in b.name.lower() and 'qvm' in b.name.lower():
+        backend = provider.get_backend(b.name)
+        print(f" Connected: {b.name}\n")
+        break
+
+if not backend:
+    raise RuntimeError("Rigetti QVM not found!")
+
+# ============================================================================
+# GLOBAL TIMER
+# ============================================================================
+class GlobalTimer:
+    def __init__(self, max_runtime):
+        self.start_time = time.time()
+        self.max_runtime = max_runtime
+        self.lock = threading.Lock()
+        self._should_stop = False
+        
+    def elapsed(self):
+        return time.time() - self.start_time
+    
+    def should_continue(self):
+        if self.elapsed() >= self.max_runtime:
+            with self.lock:
+                self._should_stop = True
+            return False
+        return not self._should_stop
+
+timer = GlobalTimer(MAX_RUNTIME)
+
+# ============================================================================
+# CHIMERA STATE - SIMPLE VERSION
+# ============================================================================
+
+def create_chimera_circuit(n_qubits, theta_deg):
+    """
+    Simple chimera state circuit that WORKS
+    """
+    qc = QuantumCircuit(n_qubits, n_qubits)
+    theta = np.radians(theta_deg)
+    
+    # GHZ-type entanglement
+    qc.h(0)
+    for i in range(min(n_qubits-1, 3)):
+        qc.cx(i, i+1)
+    
+    # Chimera parameter
+    qc.ry(theta, 0)
+    if n_qubits > 1:
+        qc.ry(theta/2, 1)
+    
+    # Measure
+    qc.measure(range(n_qubits), range(n_qubits))
+    
+    return qc
+
+# ============================================================================
+# DISCORD CALCULATION - FIXED
+# ============================================================================
+
+def calculate_discord(counts, n_qubits):
+    """Calculate quantum discord"""
+    from collections import defaultdict
+    
+    total_shots = sum(counts.values())
+    
+    # Separate by control qubit (first qubit)
+    counts_0 = defaultdict(int)
+    counts_1 = defaultdict(int)
+    
+    for bitstring, count in counts.items():
+        bits = bitstring[::-1]  # Reverse for standard ordering
+        if len(bits) >= n_qubits:
+            if bits[0] == '0':
+                counts_0[bits[1:]] += count
+            else:
+                counts_1[bits[1:]] += count
+    
+    total_0 = sum(counts_0.values())
+    total_1 = sum(counts_1.values())
+    
+    if total_0 == 0 or total_1 == 0:
+        return 0.0
+    
+    p_0 = total_0 / total_shots
+    p_1 = total_1 / total_shots
+    
+    # Compute entropies
+    def calc_entropy(counts_dict, total):
+        if total == 0:
+            return 0
+        probs = [c/total for c in counts_dict.values() if c > 0]
+        return entropy(probs, base=2) if len(probs) > 0 else 0
+    
+    H_0 = calc_entropy(counts_0, total_0)
+    H_1 = calc_entropy(counts_1, total_1)
+    
+    # Total subsystem entropy
+    all_subsystem = defaultdict(int)
+    for bitstring, count in counts.items():
+        bits = bitstring[::-1]
+        if len(bits) >= n_qubits:
+            all_subsystem[bits[1:]] += count
+    
+    H_total = calc_entropy(all_subsystem, total_shots)
+    
+    # Discord = steering (simplified)
+    discord = H_total - (p_0 * H_0 + p_1 * H_1)
+    
+    return max(0, discord)
+
+# ============================================================================
+# STEERING CALCULATION
+# ============================================================================
+
+def calculate_steering(counts, n_qubits):
+    """Simple steering parameter"""
+    total = sum(counts.values())
+    
+    even_parity = sum(count for bits, count in counts.items() 
+                      if bits.count('1') % 2 == 0)
+    odd_parity = sum(count for bits, count in counts.items() 
+                     if bits.count('1') % 2 == 1)
+    
+    return abs(even_parity - odd_parity) / total
+
+# ============================================================================
+# ENTANGLEMENT WITNESSES
+# ============================================================================
+
+def calculate_witnesses(counts, n_qubits):
+    """Calculate entanglement witnesses"""
+    total = sum(counts.values())
+    probs = {k: v/total for k, v in counts.items()}
+    
+    # GHZ witness
+    all_zeros = '0' * n_qubits
+    all_ones = '1' * n_qubits
+    p_ghz = probs.get(all_zeros, 0) + probs.get(all_ones, 0)
+    w_ghz = 0.5 - p_ghz
+    
+    # W-state witness
+    single_exc = sum(prob for bits, prob in probs.items()
+                     if bits.count('1') == 1)
+    w_w = 1/n_qubits - single_exc
+    
+    # Three-tangle
+    tau = abs(w_ghz - w_w)
+    
+    return {
+        'ghz_witness': w_ghz,
+        'w_witness': w_w,
+        'three_tangle': tau
+    }
+
+# ============================================================================
+# QUANTUM RESERVOIR
+# ============================================================================
+
+def create_reservoir_circuit(n_qubits, input_value):
+    """Quantum reservoir circuit"""
+    qc = QuantumCircuit(n_qubits, n_qubits)
+    
+    # Input encoding
+    for i in range(n_qubits):
+        angle = input_value * np.pi * (i + 1) / n_qubits
+        qc.ry(angle, i)
+    
+    # Fixed reservoir layer
+    np.random.seed(42)
+    for i in range(n_qubits):
+        qc.ry(np.random.uniform(0, 2*np.pi), i)
+    
+    for i in range(n_qubits-1):
+        if i % 2 == 0:
+            qc.cx(i, i+1)
+    
+    qc.measure_all()
+    return qc
+
+def generate_sequence(task='sine', length=5):
+    """Generate test time series"""
+    if task == 'sine':
+        t = np.linspace(0, 2*np.pi, length)
+        return 0.5 + 0.5 * np.sin(t)
+    elif task == 'square':
+        return [0.2 if i % 2 == 0 else 0.8 for i in range(length)]
+    elif task == 'sawtooth':
+        return [(i % 5) / 5.0 for i in range(length)]
+    elif task == 'chaotic':
+        x = [0.5]
+        for _ in range(length-1):
+            x.append(3.8 * x[-1] * (1 - x[-1]))
+        return x
+
+# ============================================================================
+# PARALLEL EXECUTOR
+# ============================================================================
+
+class ParallelExecutor:
+    def __init__(self, backend, timer):
+        self.backend = backend
+        self.timer = timer
+        self.results_lock = threading.Lock()
+        self.results = []
+        self.count = 0
+        
+    def run_single_measurement(self, params):
+        """Execute single measurement"""
+        if not self.timer.should_continue():
+            return None
+        
+        exp_type, config = params
+        
+        try:
+            if exp_type == 'chimera':
+                result = self.run_chimera(config)
+            elif exp_type == 'reservoir':
+                result = self.run_reservoir(config)
+            else:
+                return None
+            
+            if result:
+                with self.results_lock:
+                    self.results.append(result)
+                    self.count += 1
+                print(".", end='', flush=True)
+                return result
+        
+        except Exception as e:
+            print("E", end='', flush=True)
+            return None
+        
+        return None
+    
+    def run_chimera(self, config):
+        """Run chimera validation"""
+        n_qubits = config['n_qubits']
+        theta = config['theta']
+        
+        # Create and execute circuit
+        qc = create_chimera_circuit(n_qubits, theta)
+        qc_trans = transpile(qc, backend=self.backend, optimization_level=3)
+        
+        job = self.backend.run(qc_trans, shots=SHOTS)
+        counts = job.result().get_counts()
+        
+        # Calculate metrics
+        discord = calculate_discord(counts, n_qubits)
+        steering = calculate_steering(counts, n_qubits)
+        witnesses = calculate_witnesses(counts, n_qubits)
+        
+        return {
+            'type': 'chimera',
+            'n_qubits': n_qubits,
+            'theta': theta,
+            'discord': discord,
+            'steering': steering,
+            'ghz_witness': witnesses['ghz_witness'],
+            'w_witness': witnesses['w_witness'],
+            'three_tangle': witnesses['three_tangle']
+        }
+    
+    def run_reservoir(self, config):
+        """Run reservoir test"""
+        n_qubits = config['n_qubits']
+        task = config['task']
+        
+        # Generate sequence
+        sequence = generate_sequence(task, length=3)
+        
+        # Process through reservoir
+        features = []
+        for inp in sequence:
+            qc = create_reservoir_circuit(n_qubits, inp)
+            qc_trans = transpile(qc, backend=self.backend, optimization_level=3)
+            
+            job = self.backend.run(qc_trans, shots=SHOTS)
+            counts = job.result().get_counts()
+            
+            # Extract entropy
+            total = sum(counts.values())
+            probs = [c/total for c in counts.values()]
+            ent = entropy(probs, base=2)
+            features.append(ent)
+        
+        return {
+            'type': 'reservoir',
+            'n_qubits': n_qubits,
+            'task': task,
+            'mean_entropy': np.mean(features),
+            'std_entropy': np.std(features)
+        }
+    
+    def run_parallel_batch(self, params_list):
+        """Execute batch in parallel"""
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(self.run_single_measurement, params): params
+                for params in params_list
+            }
+            
+            for future in as_completed(futures):
+                if not self.timer.should_continue():
+                    break
+                future.result()
+
+# ============================================================================
+# MAIN EXPERIMENT
+# ============================================================================
+
+def main():
+    print("="*80)
+    print("EXPERIMENT START")
+    print("="*80)
+    
+    executor = ParallelExecutor(backend, timer)
+    
+    # PART 1: CHIMERA VALIDATION
+    print("\n" + "="*80)
+    print("PART 1: CHIMERA STATE VALIDATION")
+    print("="*80)
+    
+    chimera_params = []
+    for n in [4, 6]:
+        for theta in [0, 30, 45, 60, 90]:
+            for rep in range(3):
+                chimera_params.append(('chimera', {
+                    'n_qubits': n,
+                    'theta': theta
+                }))
+    
+    print(f"\nChimera tasks: {len(chimera_params)}")
+    print("Progress: ", end='', flush=True)
+    
+    executor.run_parallel_batch(chimera_params)
+    
+    chimera_results = [r for r in executor.results if r['type'] == 'chimera']
+    print(f"\n Completed: {len(chimera_results)} chimera measurements")
+    
+    # PART 2: QUANTUM RESERVOIR
+    if timer.should_continue() and len(executor.results) < 60:
+        print("\n" + "="*80)
+        print("PART 2: QUANTUM RESERVOIR COMPUTING")
+        print("="*80)
+        
+        reservoir_params = []
+        for n in [4, 6]:
+            for task in ['sine', 'square', 'sawtooth', 'chaotic']:
+                for rep in range(2):
+                    reservoir_params.append(('reservoir', {
+                        'n_qubits': n,
+                        'task': task
+                    }))
+        
+        print(f"\nReservoir tasks: {len(reservoir_params)}")
+        print("Progress: ", end='', flush=True)
+        
+        remaining = 60 - len(executor.results)
+        executor.run_parallel_batch(reservoir_params[:remaining])
+        
+        reservoir_results = [r for r in executor.results if r['type'] == 'reservoir']
+        print(f"\n Completed: {len(reservoir_results)} reservoir measurements")
+    
+    # ANALYSIS
+    print("\n" + "="*80)
+    print("ANALYSIS")
+    print("="*80)
+    
+    print(f"\nTotal measurements: {len(executor.results)}")
+    print(f"Chimera validations: {len([r for r in executor.results if r['type'] == 'chimera'])}")
+    print(f"Reservoir tests: {len([r for r in executor.results if r['type'] == 'reservoir'])}")
+    
+    # Chimera analysis
+    if chimera_results:
+        print("\n" + "-"*80)
+        print("CHIMERA STATE VALIDATION")
+        print("-"*80)
+        
+        for n in [4, 6]:
+            n_data = [r for r in chimera_results if r['n_qubits'] == n]
+            if n_data:
+                print(f"\nN = {n} qubits:")
+                
+                # Find maximum discord
+                max_discord = max(r['discord'] for r in n_data)
+                optimal = [r for r in n_data if r['discord'] == max_discord][0]
+                
+                print(f"  Optimal  = {optimal['theta']}°")
+                print(f"  Max discord = {max_discord:.4f}")
+                print(f"  Steering = {optimal['steering']:.4f}")
+                
+                # Check 45° specifically
+                discord_45 = [r['discord'] for r in n_data if r['theta'] == 45]
+                if discord_45:
+                    print(f"  Discord at 45° = {np.mean(discord_45):.4f}")
+                    if np.mean(discord_45) >= max_discord * 0.9:
+                        print("   Discord peaks near 45°!")
+    
+    # Reservoir analysis
+    reservoir_results = [r for r in executor.results if r['type'] == 'reservoir']
+    if reservoir_results:
+        print("\n" + "-"*80)
+        print("QUANTUM RESERVOIR COMPUTING")
+        print("-"*80)
+        
+        for task in ['sine', 'square', 'sawtooth', 'chaotic']:
+            task_data = [r for r in reservoir_results if r['task'] == task]
+            if task_data:
+                mean_ent = np.mean([r['mean_entropy'] for r in task_data])
+                print(f"\n{task.upper()}: entropy = {mean_ent:.4f}")
+    
+    # SAVE TO CSV - QBRAID COMPATIBLE
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    csv_filename = f'chimera_reservoir_{timestamp}.csv'  # Save in current directory
+    
+    if executor.results:
+        all_keys = set()
+        for r in executor.results:
+            all_keys.update(r.keys())
+        
+        with open(csv_filename, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=sorted(all_keys))
+            writer.writeheader()
+            for r in executor.results:
+                writer.writerow(r)
+        
+        print(f"\n Results saved to {csv_filename}")
+        print(f"   (in current QBraid directory)")
+    
+    print(f" Total runtime: {timer.elapsed():.1f}s")
+    print(f" Measurements completed: {len(executor.results)}")
+    
+    print("\n" + "="*80)
+    print("EXPERIMENT COMPLETE")
+    print("="*80)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n  Interrupted")
+    except Exception as e:
+        print(f"\n\n Error: {e}")
+        import traceback
+        traceback.print_exc()
